@@ -1,4 +1,3 @@
-# coding=utf-8
 from typing import Callable, Union
 from torch_geometric.typing import OptPairTensor, Adj, OptTensor, Size
 
@@ -20,15 +19,28 @@ class GINEConv(MessagePassing):
         self.nn = nn
         self.initial_eps = eps
 
+        ## ATT
+        dummy_input = torch.randn(1, nn.inputSize)
+        output_dim = self.nn(dummy_input).size(1)
+        self.att_lin = torch.nn.Linear(output_dim, output_dim)  # node features
+        self.attention = torch.nn.Linear(2 * output_dim, 1)
+
         if isinstance(activation, str):
             self.activation = getattr(F, activation)
         else:
-            self.activation = None       
+            self.activation = None
 
         if train_eps:
             self.eps = torch.nn.Parameter(torch.Tensor([eps]))
         else:
             self.register_buffer('eps', torch.Tensor([eps]))
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        torch.nn.init.xavier_uniform_(self.att_lin.weight)
+        torch.nn.init.xavier_uniform_(self.attention.weight)
+        self.att_lin.bias.data.fill_(0)
+        self.attention.bias.data.fill_(0)
 
     def forward(self, x: Union[Tensor, OptPairTensor], edge_index: Adj,
                 edge_attr: OptTensor = None, size: Size = None) -> Tensor:
@@ -45,6 +57,7 @@ class GINEConv(MessagePassing):
 
         # propagate_type: (x: OptPairTensor, edge_attr: OptTensor)
         out = self.propagate(edge_index, x=x, edge_attr=edge_attr, size=size)
+        #out = self.propagate(edge_index, x=x, size=size, edge_attr=edge_attr)
 
         x_r = x[1]
         if x_r is not None:
@@ -52,19 +65,98 @@ class GINEConv(MessagePassing):
 
         return self.nn(out)
 
-    def message(self, x_j: Tensor, edge_attr: Tensor) -> Tensor:
+    def message(self, x_j: Tensor, edge_index: Adj, edge_attr: Tensor) -> Tensor:
+        row, col = edge_index
+        x_j_transformed = F.relu(self.att_lin(x_j))
+
+        # Compute att. coeffs
+        alpha = self.attention(torch.cat([x_j_transformed[row], x_j_transformed[col]], dim=-1))
+        alpha = F.leaky_relu(alpha)
+        alpha = F.softmax(alpha, dim=1)
+
         if self.activation:
-            return self.activation(x_j + edge_attr)
+            return self.activation(alpha * (x_j + edge_attr))
         else:
-            return x_j + edge_attr
+            return alpha * (x_j + edge_attr)
 
     def __repr__(self):
-        return '{}(nn={})'.format(self.__class__.__name__, self.nn)        
+        return '{}(nn={})'.format(self.__class__.__name__, self.nn)
 
+class GINEConvAtt(MessagePassing):
+
+    def __init__(self, nn: Callable, eps: float = 0., train_eps: bool = False,
+                 activation="softplus", **kwargs):
+        super(GINEConv, self).__init__(aggr='add', **kwargs)
+        self.nn = nn
+        self.initial_eps = eps
+
+        #### ATTENTION
+        dummy_input = torch.randn(1, nn.inputSize)
+        output_dim = self.nn(dummy_input).size(1)
+        self.att_lin = torch.nn.Linear(output_dim, output_dim)  # node features
+        self.attention = torch.nn.Linear(2 * output_dim, 1)
+
+
+        if isinstance(activation, str):
+            self.activation = getattr(F, activation)
+        else:
+            self.activation = None
+
+        if train_eps:
+            self.eps = torch.nn.Parameter(torch.Tensor([eps]))
+        else:
+            self.register_buffer('eps', torch.Tensor([eps]))
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        torch.nn.init.xavier_uniform_(self.att_lin.weight)
+        torch.nn.init.xavier_uniform_(self.attention.weight)
+        self.att_lin.bias.data.fill_(0)
+        self.attention.bias.data.fill_(0)
+
+    def forward(self, x: Union[Tensor, OptPairTensor], edge_index: Adj,
+                edge_attr: OptTensor = None, size: Size = None) -> Tensor:
+        """"""
+        if isinstance(x, Tensor):
+            x: OptPairTensor = (x, x)
+
+        # Node and edge feature dimensionalites need to match.
+        if isinstance(edge_index, Tensor):
+            assert edge_attr is not None
+            assert x[0].size(-1) == edge_attr.size(-1)
+        elif isinstance(edge_index, SparseTensor):
+            assert x[0].size(-1) == edge_index.size(-1)
+
+        # propagate_type: (x: OptPairTensor, edge_attr: OptTensor)
+        out = self.propagate(edge_index, x=x, edge_attr=edge_attr, size=size)
+        #out = self.propagate(edge_index, x=x, size=size, edge_attr=edge_attr)
+
+        x_r = x[1]
+        if x_r is not None:
+            out += (1 + self.eps) * x_r
+
+        return self.nn(out)
+
+    def message(self, x_j: Tensor, edge_index: Adj, edge_attr: Tensor) -> Tensor:
+        row, col = edge_index
+        x_j_transformed = F.relu(self.att_lin(x_j))
+
+        # Compute att. coeffs
+        alpha = self.attention(torch.cat([x_j_transformed[row], x_j_transformed[col]], dim=-1))
+        alpha = F.leaky_relu(alpha)
+        alpha = F.softmax(alpha, dim=1)
+
+        if self.activation:
+            return self.activation(alpha * (x_j + edge_attr))
+        else:
+            return alpha * (x_j + edge_attr)
+
+    def __repr__(self):
+        return '{}(nn={})'.format(self.__class__.__name__, self.nn)
 
 class GINEncoder(torch.nn.Module):
 
-    def __init__(self, hidden_dim, num_convs=3, activation='relu', short_cut=True, concat_hidden=False):
+    def __init__(self, hidden_dim, num_convs=3, activation='relu', short_cut=True, concat_hidden=False, att=False, heads=1):
         super().__init__()
 
         self.hidden_dim = hidden_dim
@@ -76,14 +168,15 @@ class GINEncoder(torch.nn.Module):
         if isinstance(activation, str):
             self.activation = getattr(F, activation)
         else:
-            self.activation = None 
-        
+            self.activation = None
+
         self.convs = nn.ModuleList()
         for i in range(self.num_convs):
             self.convs.append(GINEConv(MultiLayerPerceptron(hidden_dim, [hidden_dim, hidden_dim], \
-                                    activation=activation), activation=activation))
-
-    
+                                                            activation=activation), activation=activation))
+        self.att = att
+        if att:
+            self.self_attention = torch_geometric.nn.GATConv(hidden_dim, hidden_dim, heads=heads, concat=False)
 
     def forward(self, z, edge_index, edge_attr):
         """
@@ -96,16 +189,16 @@ class GINEncoder(torch.nn.Module):
             graph feature
         """
 
-        node_attr = self.node_emb(z)    # (num_node, hidden)
- 
+        node_attr = self.node_emb(z)  # (num_node, hidden)
+
         hiddens = []
-        conv_input = node_attr # (num_node, hidden)
+        conv_input = node_attr  # (num_node, hidden)
 
         for conv_idx, conv in enumerate(self.convs):
             hidden = conv(conv_input, edge_index, edge_attr)
             if conv_idx < len(self.convs) - 1 and self.activation is not None:
                 hidden = self.activation(hidden)
-            assert hidden.shape == conv_input.shape                
+            assert hidden.shape == conv_input.shape
             if self.short_cut and hidden.shape == conv_input.shape:
                 hidden += conv_input
 
@@ -116,5 +209,8 @@ class GINEncoder(torch.nn.Module):
             node_feature = torch.cat(hiddens, dim=-1)
         else:
             node_feature = hiddens[-1]
-
+        if self.att:
+            attention_features = self.self_attention(node_feature, edge_index)
+            combined_features = attention_features + node_feature
+            return combined_features
         return node_feature
